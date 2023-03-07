@@ -1,5 +1,5 @@
 /*
- * Copyright 2018-2019 The NATS Authors
+ * Copyright 2018-2020 The NATS Authors
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -84,14 +84,54 @@ func (o *OperatorLimits) Validate(_ *ValidationResults) {
 	// negative values mean unlimited, so all numbers are valid
 }
 
+// Mapping for publishes
+type WeightedMapping struct {
+	Subject Subject `json:"subject"`
+	Weight  uint8   `json:"weight,omitempty"`
+	Cluster string  `json:"cluster,omitempty"`
+}
+
+func (m *WeightedMapping) GetWeight() uint8 {
+	if m.Weight == 0 {
+		return 100
+	}
+	return m.Weight
+}
+
+type Mapping map[Subject][]WeightedMapping
+
+func (m *Mapping) Validate(vr *ValidationResults) {
+	for ubFrom, wm := range (map[Subject][]WeightedMapping)(*m) {
+		ubFrom.Validate(vr)
+		total := uint8(0)
+		for _, wm := range wm {
+			wm.Subject.Validate(vr)
+			if wm.Subject.HasWildCards() {
+				vr.AddError("Subject %q in weighted mapping %q is not allowed to contains wildcard",
+					string(wm.Subject), ubFrom)
+			}
+			total += wm.GetWeight()
+		}
+		if total > 100 {
+			vr.AddError("Mapping %q exceeds 100%% among all of it's weighted to mappings", ubFrom)
+		}
+	}
+}
+
+func (a *Account) AddMapping(sub Subject, to ...WeightedMapping) {
+	a.Mappings[sub] = to
+}
+
 // Account holds account specific claims data
 type Account struct {
 	Imports            Imports        `json:"imports,omitempty"`
 	Exports            Exports        `json:"exports,omitempty"`
 	Limits             OperatorLimits `json:"limits,omitempty"`
-	SigningKeys        StringList     `json:"signing_keys,omitempty"`
+	SigningKeys        SigningKeys    `json:"signing_keys,omitempty"`
 	Revocations        RevocationList `json:"revocations,omitempty"`
 	DefaultPermissions Permissions    `json:"default_permissions,omitempty"`
+	Mappings           Mapping        `json:"mappings,omitempty"`
+	Info
 	GenericFields
 }
 
@@ -101,6 +141,7 @@ func (a *Account) Validate(acct *AccountClaims, vr *ValidationResults) {
 	a.Exports.Validate(vr)
 	a.Limits.Validate(vr)
 	a.DefaultPermissions.Validate(vr)
+	a.Mappings.Validate(vr)
 
 	if !a.Limits.IsEmpty() && a.Limits.Imports >= 0 && int64(len(a.Imports)) > a.Limits.Imports {
 		vr.AddError("the account contains more imports than allowed by the operator")
@@ -125,12 +166,8 @@ func (a *Account) Validate(acct *AccountClaims, vr *ValidationResults) {
 			}
 		}
 	}
-
-	for _, k := range a.SigningKeys {
-		if !nkeys.IsValidPublicAccountKey(k) {
-			vr.AddError("%s is not an account public key", k)
-		}
-	}
+	a.SigningKeys.Validate(vr)
+	a.Info.Validate(vr)
 }
 
 // AccountClaims defines the body of an account JWT
@@ -145,13 +182,15 @@ func NewAccountClaims(subject string) *AccountClaims {
 		return nil
 	}
 	c := &AccountClaims{}
+	c.SigningKeys = make(SigningKeys)
 	// Set to unlimited to start. We do it this way so we get compiler
 	// errors if we add to the OperatorLimits.
 	c.Limits = OperatorLimits{
 		NatsLimits{NoLimit, NoLimit, NoLimit},
 		AccountLimits{NoLimit, NoLimit, true, NoLimit, NoLimit},
-		JetStreamLimits{NoLimit, NoLimit, NoLimit, NoLimit}}
+		JetStreamLimits{0, 0, 0, 0}}
 	c.Subject = subject
+	c.Mappings = Mapping{}
 	return c
 }
 
@@ -219,9 +258,9 @@ func (a *AccountClaims) Claims() *ClaimsData {
 }
 
 // DidSign checks the claims against the account's public key and its signing keys
-func (a *AccountClaims) DidSign(op Claims) bool {
-	if op != nil {
-		issuer := op.Claims().Issuer
+func (a *AccountClaims) DidSign(uc Claims) bool {
+	if uc != nil {
+		issuer := uc.Claims().Issuer
 		if issuer == a.Subject {
 			return true
 		}
@@ -235,13 +274,14 @@ func (a *AccountClaims) Revoke(pubKey string) {
 	a.RevokeAt(pubKey, time.Now())
 }
 
-// RevokeAt enters a revocation by public key and timestamp into this export
+// RevokeAt enters a revocation by public key and timestamp into this account
+// This will revoke all jwt issued for pubKey, prior to timestamp
 // If there is already a revocation for this public key that is newer, it is kept.
+// The value is expected to be a public key or "*" (means all public keys)
 func (a *AccountClaims) RevokeAt(pubKey string, timestamp time.Time) {
 	if a.Revocations == nil {
 		a.Revocations = RevocationList{}
 	}
-
 	a.Revocations.Revoke(pubKey, timestamp)
 }
 
@@ -250,14 +290,18 @@ func (a *AccountClaims) ClearRevocation(pubKey string) {
 	a.Revocations.ClearRevocation(pubKey)
 }
 
-// IsRevokedAt checks if the public key is in the revoked list with a timestamp later than
-// the one passed in. Generally this method is called with time.Now() but other time's can
-// be used for testing.
-func (a *AccountClaims) IsRevokedAt(pubKey string, timestamp time.Time) bool {
-	return a.Revocations.IsRevoked(pubKey, timestamp)
+// isRevoked checks if the public key is in the revoked list with a timestamp later than the one passed in.
+// Generally this method is called with the subject and issue time of the jwt to be tested.
+// DO NOT pass time.Now(), it will not produce a stable/expected response.
+func (a *AccountClaims) isRevoked(pubKey string, claimIssuedAt time.Time) bool {
+	return a.Revocations.IsRevoked(pubKey, claimIssuedAt)
 }
 
-// IsRevoked checks if the public key is in the revoked list with time.Now()
-func (a *AccountClaims) IsRevoked(pubKey string) bool {
-	return a.Revocations.IsRevoked(pubKey, time.Now())
+// IsClaimRevoked checks if the account revoked the claim passed in.
+// Invalid claims (nil, no Subject or IssuedAt) will return true.
+func (a *AccountClaims) IsClaimRevoked(claim *UserClaims) bool {
+	if claim == nil || claim.IssuedAt == 0 || claim.Subject == "" {
+		return true
+	}
+	return a.isRevoked(claim.Subject, time.Unix(claim.IssuedAt, 0))
 }

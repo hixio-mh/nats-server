@@ -16,6 +16,7 @@
 package jwt
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -56,13 +57,49 @@ const (
 // }
 //
 type ServiceLatency struct {
-	Sampling int     `json:"sampling,omitempty"`
-	Results  Subject `json:"results"`
+	Sampling SamplingRate `json:"sampling"`
+	Results  Subject      `json:"results"`
+}
+
+type SamplingRate int
+
+const Headers = SamplingRate(0)
+
+// MarshalJSON marshals the field as "headers" or percentages
+func (r *SamplingRate) MarshalJSON() ([]byte, error) {
+	sr := *r
+	if sr == 0 {
+		return []byte(`"headers"`), nil
+	}
+	if sr >= 1 && sr <= 100 {
+		return []byte(fmt.Sprintf("%d", sr)), nil
+	}
+	return nil, fmt.Errorf("unknown sampling rate")
+}
+
+// UnmarshalJSON unmashals numbers as percentages or "headers"
+func (t *SamplingRate) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 {
+		return fmt.Errorf("empty sampling rate")
+	}
+	if strings.ToLower(string(b)) == `"headers"` {
+		*t = Headers
+		return nil
+	}
+	var j int
+	err := json.Unmarshal(b, &j)
+	if err != nil {
+		return err
+	}
+	*t = SamplingRate(j)
+	return nil
 }
 
 func (sl *ServiceLatency) Validate(vr *ValidationResults) {
-	if sl.Sampling < 1 || sl.Sampling > 100 {
-		vr.AddError("sampling percentage needs to be between 1-100")
+	if sl.Sampling != 0 {
+		if sl.Sampling < 1 || sl.Sampling > 100 {
+			vr.AddError("sampling percentage needs to be between 1-100")
+		}
 	}
 	sl.Results.Validate(vr)
 	if sl.Results.HasWildCards() {
@@ -81,6 +118,8 @@ type Export struct {
 	ResponseThreshold    time.Duration   `json:"response_threshold,omitempty"`
 	Latency              *ServiceLatency `json:"service_latency,omitempty"`
 	AccountTokenPosition uint            `json:"account_token_position,omitempty"`
+	Advertise            bool            `json:"advertise,omitempty"`
+	Info
 }
 
 // IsService returns true if an export is for a service
@@ -153,6 +192,7 @@ func (e *Export) Validate(vr *ValidationResults) {
 			}
 		}
 	}
+	e.Info.Validate(vr)
 }
 
 // Revoke enters a revocation by publickey using time.Now().
@@ -175,16 +215,20 @@ func (e *Export) ClearRevocation(pubKey string) {
 	e.Revocations.ClearRevocation(pubKey)
 }
 
-// IsRevokedAt checks if the public key is in the revoked list with a timestamp later than
-// the one passed in. Generally this method is called with time.Now() but other time's can
-// be used for testing.
-func (e *Export) IsRevokedAt(pubKey string, timestamp time.Time) bool {
-	return e.Revocations.IsRevoked(pubKey, timestamp)
+// isRevoked checks if the public key is in the revoked list with a timestamp later than the one passed in.
+// Generally this method is called with the subject and issue time of the jwt to be tested.
+// DO NOT pass time.Now(), it will not produce a stable/expected response.
+func (e *Export) isRevoked(pubKey string, claimIssuedAt time.Time) bool {
+	return e.Revocations.IsRevoked(pubKey, claimIssuedAt)
 }
 
-// IsRevoked checks if the public key is in the revoked list with time.Now()
-func (e *Export) IsRevoked(pubKey string) bool {
-	return e.Revocations.IsRevoked(pubKey, time.Now())
+// IsClaimRevoked checks if the activation revoked the claim passed in.
+// Invalid claims (nil, no Subject or IssuedAt) will return true.
+func (e *Export) IsClaimRevoked(claim *ActivationClaims) bool {
+	if claim == nil || claim.IssuedAt == 0 || claim.Subject == "" {
+		return true
+	}
+	return e.isRevoked(claim.Subject, time.Unix(claim.IssuedAt, 0))
 }
 
 // Exports is a slice of exports
